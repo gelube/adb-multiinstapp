@@ -193,3 +193,8 @@ adb-batch-manager/
 ## 📄 许可证
 
 MIT License
+## 支持项目
+
+如果这个项目对你有帮助，欢迎请作者喝杯咖啡 ☕
+
+![微信赞赏](assets/wechat-pay.jpg)
