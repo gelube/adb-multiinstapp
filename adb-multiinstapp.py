@@ -68,12 +68,21 @@ QSplitter::handle { background-color: #555; }
 class ADBWorker:
     """ADB 操作工具类"""
     
+    @staticmethod
+    def _get_app_dir():
+        """获取应用程序所在目录（兼容 PyInstaller 打包）"""
+        if getattr(sys, 'frozen', False):
+            # PyInstaller 打包后，sys.executable 是 exe 路径
+            return os.path.dirname(sys.executable)
+        else:
+            return os.path.dirname(os.path.abspath(__file__))
+
     def __init__(self, adb_path=None):
         if adb_path is None:
-            cwd = os.getcwd()
+            app_dir = self._get_app_dir()
             adb_paths = [
-                os.path.join(cwd, "adb", "adb.exe"),
-                os.path.join(cwd, "adb.exe"),
+                os.path.join(app_dir, "adb", "adb.exe"),
+                os.path.join(app_dir, "adb.exe"),
             ]
             for path in adb_paths:
                 if os.path.exists(path):
