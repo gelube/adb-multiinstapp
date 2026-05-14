@@ -193,9 +193,6 @@ adb-batch-manager/
 ## 📄 许可证
 
 MIT License
-<<<<<<< HEAD
-
-## ☕ 支持作者
 
 ## ☕ 支持项目
 
