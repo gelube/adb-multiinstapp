@@ -1170,14 +1170,14 @@ class ADBBatchManager(QMainWindow):
         row1.setSpacing(12)
         row1.addWidget(QLabel("起始 IP:"))
         self.ip_start_edit = QLineEdit()
-        self.ip_start_edit.setPlaceholderText("例如：192.168.1.100")
-        self.ip_start_edit.setToolTip("扫描的起始IP地址，支持跨网段扫描\n例如：192.168.1.100")
+        self.ip_start_edit.setPlaceholderText("192.168.1.100")
+        self.ip_start_edit.setToolTip("起始IP，支持跨网段")
         row1.addWidget(self.ip_start_edit, 3)
         
         row1.addWidget(QLabel("结束 IP:"))
         self.ip_end_edit = QLineEdit()
-        self.ip_end_edit.setPlaceholderText("例如：192.168.2.255")
-        self.ip_end_edit.setToolTip("扫描的结束IP地址\n可跨网段，如 192.168.2.255\n单IP时起始和结束填一样")
+        self.ip_end_edit.setPlaceholderText("192.168.2.255")
+        self.ip_end_edit.setToolTip("结束IP，可跨网段；单IP时与起始填一样")
         row1.addWidget(self.ip_end_edit, 3)
         scan_grid.addLayout(row1)
         
@@ -1186,9 +1186,9 @@ class ADBBatchManager(QMainWindow):
         row2.setSpacing(12)
         row2.addWidget(QLabel("ADB 端口:"))
         self.port_edit = QLineEdit()
-        self.port_edit.setPlaceholderText("5555 或 5555,5556-5558")
+        self.port_edit.setPlaceholderText("5555")
         self.port_edit.setText("5555")
-        self.port_edit.setToolTip("ADB连接端口，支持以下格式：\n• 单端口：5555\n• 多端口（逗号分隔）：5555,5556,5557\n• 端口范围（连字符）：5555-5558\n• 混合格式：5555,5556-5558")
+        self.port_edit.setToolTip("支持：5555 / 5555,5556-5558")
         row2.addWidget(self.port_edit, 3)
         
         row2.addWidget(QLabel("并发数:"))
@@ -1196,7 +1196,7 @@ class ADBBatchManager(QMainWindow):
         self.scan_threads.setRange(1, 200)
         self.scan_threads.setValue(20)
         self.scan_threads.setFixedWidth(80)
-        self.scan_threads.setToolTip("同时扫描的最大线程数\n• 局域网建议：20-50\n• 跨网段/大量IP建议：50-100\n• 数值越大扫描越快，但占用资源越多")
+        self.scan_threads.setToolTip("局域网20-50，跨网段50-100")
         row2.addWidget(self.scan_threads)
         
         row2.addSpacing(16)
@@ -1231,7 +1231,7 @@ class ADBBatchManager(QMainWindow):
         search_layout = QHBoxLayout()
         search_layout.addWidget(QLabel("🔍 搜索:"))
         self.device_search_edit = QLineEdit()
-        self.device_search_edit.setPlaceholderText("输入 IP、型号或版本号筛选设备...")
+        self.device_search_edit.setPlaceholderText("搜索设备...")
         self.device_search_edit.textChanged.connect(self.filter_device_table)
         search_layout.addWidget(self.device_search_edit)
         layout.addLayout(search_layout)
@@ -1288,8 +1288,8 @@ class ADBBatchManager(QMainWindow):
         
         apk_row = QHBoxLayout()
         self.apk_path_edit = QLineEdit()
-        self.apk_path_edit.setPlaceholderText("点击「浏览」选择 APK 文件...")
-        self.apk_path_edit.setToolTip("支持选择多个APK文件同时安装\n按住Ctrl多选，按住Shift范围选\n多APK将按顺序依次安装到每台设备")
+        self.apk_path_edit.setPlaceholderText("APK 路径")
+        self.apk_path_edit.setToolTip("Ctrl多选，多APK按顺序安装")
         apk_row.addWidget(self.apk_path_edit, 1)
         
         browse_btn = QPushButton("浏览...")
@@ -1313,8 +1313,8 @@ class ADBBatchManager(QMainWindow):
         pkg_row = QHBoxLayout()
         pkg_row.addWidget(QLabel("包名:"))
         self.package_name_edit = QLineEdit()
-        self.package_name_edit.setPlaceholderText("选APK后自动识别，或手动输入")
-        self.package_name_edit.setToolTip("应用的包名（Package Name）\n• 选择APK文件后会自动识别\n• 也可手动输入，用于版本对比检测\n• 格式如：com.company.appname")
+        self.package_name_edit.setPlaceholderText("com.example.app")
+        self.package_name_edit.setToolTip("选APK后自动识别，或手动输入")
         pkg_row.addWidget(self.package_name_edit, 1)
         pkg_layout.addLayout(pkg_row)
         
@@ -1344,7 +1344,7 @@ class ADBBatchManager(QMainWindow):
         self.install_threads.setRange(1, 100)
         self.install_threads.setValue(30)
         self.install_threads.setFixedWidth(80)
-        self.install_threads.setToolTip("同时安装的最大设备数\n• 建议：5-30\n• 数值过大可能导致设备卡顿")
+        self.install_threads.setToolTip("建议5-30，过大可能设备卡顿")
         row_threads.addWidget(self.install_threads)
         row_threads.addStretch()
         install_layout.addLayout(row_threads)
@@ -1359,7 +1359,7 @@ class ADBBatchManager(QMainWindow):
             "强制覆盖 (始终安装)"
         ])
         self.version_policy.setCurrentIndex(0)
-        self.version_policy.setToolTip("全局安装策略，可在设备列表中单独覆盖\n• 智能对比：检测已安装版本，新版本才装\n• 跳过已安装：只要有就跳过\n• 强制覆盖：不管有没有都装")
+        self.version_policy.setToolTip("可在设备列表中单独覆盖")
         row_policy.addWidget(self.version_policy, 1)
         install_layout.addLayout(row_policy)
         
@@ -1519,13 +1519,13 @@ class ADBBatchManager(QMainWindow):
         pkg_row = QHBoxLayout()
         pkg_row.addWidget(QLabel("应用包名:"))
         self.uninstall_package_edit = QLineEdit()
-        self.uninstall_package_edit.setPlaceholderText("例如：com.example.app")
-        self.uninstall_package_edit.setToolTip("要卸载的应用包名\n• 可点击「查询已安装」获取包名列表\n• 格式如：com.company.appname")
+        self.uninstall_package_edit.setPlaceholderText("com.example.app")
+        self.uninstall_package_edit.setToolTip("可点「查询已安装」获取")
         pkg_row.addWidget(self.uninstall_package_edit, 1)
         
         query_installed_btn = QPushButton("📋 查询已安装")
         query_installed_btn.setFixedWidth(110)
-        query_installed_btn.setToolTip("从选中设备查询已安装的第三方应用列表")
+        query_installed_btn.setToolTip("从选中设备查询第三方应用")
         query_installed_btn.clicked.connect(self.query_installed_apps)
         pkg_row.addWidget(query_installed_btn)
         settings_layout.addLayout(pkg_row)
@@ -1541,7 +1541,7 @@ class ADBBatchManager(QMainWindow):
         self.uninstall_threads.setRange(1, 100)
         self.uninstall_threads.setValue(30)
         self.uninstall_threads.setFixedWidth(80)
-        self.uninstall_threads.setToolTip("同时卸载的最大设备数\n• 建议：5-30")
+        self.uninstall_threads.setToolTip("建议5-30")
         thread_row.addWidget(self.uninstall_threads)
         thread_row.addStretch()
         settings_layout.addLayout(thread_row)
@@ -2024,7 +2024,7 @@ class ADBBatchManager(QMainWindow):
             # 多APK时包名输入框显示提示
             packages = [info["package"] for info in self.apk_info_list if info["package"]]
             if packages:
-                self.package_name_edit.setPlaceholderText(f"自动识别：{', '.join(packages[:3])}{'...' if len(packages) > 3 else ''}")
+                self.package_name_edit.setPlaceholderText(packages[0])
             
             # 版本信息区显示摘要
             self.version_info_label.setText(f"共 {len(file_paths)} 个APK，包名/版本已自动识别")
@@ -2426,7 +2426,7 @@ class ADBBatchManager(QMainWindow):
         layout = QVBoxLayout(dialog)
         
         search_edit = QLineEdit()
-        search_edit.setPlaceholderText("🔍 搜索包名...")
+        search_edit.setPlaceholderText("搜索包名...")
         layout.addWidget(search_edit)
         
         list_widget = QListWidget()
