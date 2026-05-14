@@ -59,6 +59,7 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
 QCheckBox { color: #d4d4d4; }
 QCheckBox::indicator { width: 14px; height: 14px; }
 QStatusBar { background-color: #3c3c3c; color: #d4d4d4; }
+QToolTip { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #666; padding: 4px; }
 QListWidget { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; }
 QListWidget::item:selected { background-color: #094771; }
 QSplitter::handle { background-color: #555; }
@@ -183,9 +184,17 @@ class ADBWorker:
             if len(lines) >= 2:
                 parts = lines[1].split()
                 if len(parts) >= 4:
-                    detail['storage_total'] = parts[1]
-                    detail['storage_used'] = parts[2]
-                    detail['storage_free'] = parts[3]
+                    try:
+                        total_kb = int(parts[1])
+                        used_kb = int(parts[2])
+                        free_kb = int(parts[3])
+                        detail['storage_total'] = f"{total_kb/1024/1024:.1f}GB"
+                        detail['storage_used'] = f"{used_kb/1024/1024:.1f}GB"
+                        detail['storage_free'] = f"{free_kb/1024/1024:.1f}GB"
+                    except (ValueError, IndexError):
+                        detail['storage_total'] = parts[1]
+                        detail['storage_used'] = parts[2]
+                        detail['storage_free'] = parts[3]
         
         # SDK版本
         success, stdout, _ = self._run_adb(device_id, "shell", "getprop", "ro.build.version.sdk", timeout=10)
@@ -644,20 +653,16 @@ class InstallThread(QThread):
     task_finished = pyqtSignal(str, bool, str, object)
     all_finished = pyqtSignal()
     
-    def __init__(self, devices, apk_paths, package_name, max_threads=10, 
+    def __init__(self, devices, apk_info_list, max_threads=10,
                  version_policy="compare", force_reinstall=False):
         super().__init__()
         self.devices = devices
-        self.apk_paths = apk_paths if isinstance(apk_paths, list) else [apk_paths]
-        self.package_name = package_name
+        self.apk_info_list = apk_info_list  # [{path, package, version_code, version_name}, ...]
         self.max_threads = max_threads
         self.version_policy = version_policy
         self.force_reinstall = force_reinstall
         self.adb = ADBWorker()
         self.stop_flag = False
-        
-        # 获取第一个 APK 版本
-        self.apk_version_code, self.apk_version_name, _ = self.adb.get_apk_version(self.apk_paths[0])
     
     def run(self):
         with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
@@ -682,8 +687,8 @@ class InstallThread(QThread):
         device_id = device["id"]
         device_info = {
             "installed_version": None,
-            "apk_version_code": self.apk_version_code,
-            "apk_version_name": self.apk_version_name
+            "apk_version_code": None,
+            "apk_version_name": None
         }
         
         try:
@@ -693,67 +698,112 @@ class InstallThread(QThread):
             self.install_progress.emit(device_id, "reconnecting", "正在重连设备...", device_info)
             self.adb.connect(ip, port, timeout=3)
             
-            # 检查是否已安装
-            is_installed = self.adb.is_installed(device_id, self.package_name)
-            
-            if is_installed:
-                success, stdout, _ = self.adb._run_adb(
-                    device_id, "shell", "dumpsys", "package", self.package_name, timeout=30
-                )
-                installed_code = None
-                installed_name = None
-                if success and stdout:
-                    match = re.search(r'versionCode=(\d+)', stdout)
-                    if match:
-                        installed_code = int(match.group(1))
-                    match = re.search(r'versionName=([\d.]+)', stdout)
-                    if match:
-                        installed_name = match.group(1)
-                
-                device_info["installed_version"] = installed_name or installed_code
-                
-                if self.version_policy == "skip":
-                    self.install_progress.emit(device_id, "skipped", f"已安装 (v{installed_name or installed_code})，跳过", device_info)
-                    return device_id, True, f"已安装，跳过", device_info
-                
-                elif self.version_policy == "compare" and installed_code:
-                    if self.apk_version_code and installed_code >= self.apk_version_code:
-                        self.install_progress.emit(device_id, "skipped", f"已是最新版本 (v{installed_name})，跳过", device_info)
-                        return device_id, True, f"已是最新版本，跳过", device_info
-                    else:
-                        self.install_progress.emit(device_id, "comparing", 
-                            f"版本对比：已安装 v{installed_name} → 新版本 v{self.apk_version_name}", device_info)
-                
-                elif self.version_policy == "reinstall" or self.force_reinstall:
-                    self.install_progress.emit(device_id, "uninstalling", "正在卸载旧版本...", device_info)
-                    success, msg = self.adb.uninstall(device_id, self.package_name)
-                    if not success:
-                        self.install_progress.emit(device_id, "error", f"卸载失败：{msg}", device_info)
-                        return device_id, False, f"卸载失败：{msg}", device_info
-            
-            # 逐个安装 APK（支持多APK #17）
             all_success = True
             last_msg = ""
-            for idx, apk_path in enumerate(self.apk_paths):
+            
+            # 逐个安装APK，每个APK用自己的包名做版本对比
+            for idx, apk_info in enumerate(self.apk_info_list):
+                apk_path = apk_info["path"]
+                package_name = apk_info["package"]
+                apk_version_code = apk_info["version_code"]
+                apk_version_name = apk_info["version_name"]
                 apk_name = os.path.basename(apk_path)
-                if len(self.apk_paths) > 1:
-                    self.install_progress.emit(device_id, "installing", 
-                        f"正在安装 ({idx+1}/{len(self.apk_paths)}) {apk_name}...", device_info)
+                
+                # 更新device_info用于结果记录
+                device_info["apk_version_code"] = apk_version_code
+                device_info["apk_version_name"] = apk_version_name
+                
+                # 如果没有包名，跳过版本对比，直接安装
+                if not package_name:
+                    self.install_progress.emit(device_id, "installing",
+                        f"正在安装 ({idx+1}/{len(self.apk_info_list)}) {apk_name} (无包名，跳过对比)...", device_info)
+                    success, msg, phase = self.adb.install(device_id, apk_path, replace=True)
+                    if not success:
+                        all_success = False
+                        last_msg = f"{apk_name}: {msg}"
+                        self.install_progress.emit(device_id, "error", last_msg, device_info)
+                        break
+                    last_msg = f"{apk_name}: 安装成功"
+                    continue
+                
+                # 版本对比检查
+                is_installed = self.adb.is_installed(device_id, package_name)
+                skip_this = False
+                need_uninstall = False
+                
+                if is_installed:
+                    success, stdout, _ = self.adb._run_adb(
+                        device_id, "shell", "dumpsys", "package", package_name, timeout=30
+                    )
+                    installed_code = None
+                    installed_name = None
+                    if success and stdout:
+                        match = re.search(r'versionCode=(\d+)', stdout)
+                        if match:
+                            installed_code = int(match.group(1))
+                        match = re.search(r'versionName=([\d.]+)', stdout)
+                        if match:
+                            installed_name = match.group(1)
+                    
+                    device_info["installed_version"] = installed_name or installed_code
+                    
+                    if self.version_policy == "skip":
+                        self.install_progress.emit(device_id, "skipped",
+                            f"{apk_name} 已安装 (v{installed_name or installed_code})，跳过", device_info)
+                        last_msg = f"{apk_name}: 已安装，跳过"
+                        skip_this = True
+                    
+                    elif self.version_policy == "compare" and installed_code and apk_version_code:
+                        if installed_code >= apk_version_code:
+                            self.install_progress.emit(device_id, "skipped",
+                                f"{apk_name} 已是最新版本 (v{installed_name})，跳过", device_info)
+                            last_msg = f"{apk_name}: 已是最新版本，跳过"
+                            skip_this = True
+                        else:
+                            self.install_progress.emit(device_id, "comparing",
+                                f"{apk_name} 版本对比：已安装 v{installed_name} → 新版本 v{apk_version_name}", device_info)
+                    
+                    elif self.version_policy == "force":
+                        need_uninstall = True
+                
+                if skip_this:
+                    continue
+                
+                # 卸载旧版本
+                if need_uninstall:
+                    self.install_progress.emit(device_id, "uninstalling",
+                        f"正在卸载 {apk_name} 旧版本...", device_info)
+                    success, msg = self.adb.uninstall(device_id, package_name)
+                    if not success:
+                        self.install_progress.emit(device_id, "error",
+                            f"{apk_name} 卸载失败：{msg}", device_info)
+                        all_success = False
+                        last_msg = f"{apk_name}: 卸载失败 - {msg}"
+                        break
+                
+                # 安装APK
+                if len(self.apk_info_list) > 1:
+                    self.install_progress.emit(device_id, "installing",
+                        f"正在安装 ({idx+1}/{len(self.apk_info_list)}) {apk_name}...", device_info)
                 else:
-                    self.install_progress.emit(device_id, "installing", 
-                        f"正在安装 v{self.apk_version_name or self.apk_version_code}...", device_info)
+                    self.install_progress.emit(device_id, "installing",
+                        f"正在安装 v{apk_version_name or apk_version_code}...", device_info)
                 
                 success, msg, phase = self.adb.install(device_id, apk_path, replace=True)
                 
                 if not success:
                     all_success = False
-                    last_msg = msg
-                    self.install_progress.emit(device_id, "error", msg, device_info)
-                    break  # 一个失败就停止
+                    last_msg = f"{apk_name}: {msg}"
+                    self.install_progress.emit(device_id, "error", last_msg, device_info)
+                    break
                 else:
-                    last_msg = "安装成功"
+                    last_msg = f"{apk_name}: 安装成功"
                     if phase == 'transferring':
                         self.install_progress.emit(device_id, "installing", "传输完成，正在安装...", device_info)
+            
+            if all_success and not last_msg:
+                # 全部跳过的情况
+                last_msg = "全部已安装，跳过"
             
             if all_success:
                 self.install_progress.emit(device_id, "success", last_msg, device_info)
@@ -775,11 +825,10 @@ class RetryInstallThread(QThread):
     retry_finished = pyqtSignal(str, bool, str)
     all_finished = pyqtSignal()
     
-    def __init__(self, failed_devices, apk_paths, package_name, max_threads=5):
+    def __init__(self, failed_devices, apk_info_list, max_threads=10):
         super().__init__()
         self.failed_devices = failed_devices
-        self.apk_paths = apk_paths if isinstance(apk_paths, list) else [apk_paths]
-        self.package_name = package_name
+        self.apk_info_list = apk_info_list  # [{path, package, ...}, ...]
         self.max_threads = max_threads
         self.adb = ADBWorker()
         self.stop_flag = False
@@ -812,16 +861,22 @@ class RetryInstallThread(QThread):
         port = device.get("port", int(device_id.split(":")[1]) if ":" in device_id else 5555)
         self.adb.connect(ip, port, timeout=3)
         
-        # 先尝试卸载
-        self.retry_progress.emit(device_id, "uninstalling", "正在清理旧版本...")
-        self.adb.uninstall(device_id, self.package_name, timeout=30)
-        
-        # 逐个安装 APK
-        for idx, apk_path in enumerate(self.apk_paths):
+        # 逐个APK处理
+        for idx, apk_info in enumerate(self.apk_info_list):
+            apk_path = apk_info["path"]
+            package_name = apk_info.get("package", "")
+            apk_name = os.path.basename(apk_path)
+            
+            # 先尝试卸载旧版本
+            if package_name:
+                self.retry_progress.emit(device_id, "uninstalling", f"正在卸载 {apk_name} 旧版本...")
+                self.adb.uninstall(device_id, package_name, timeout=30)
+            
+            # 安装
             success, msg, phase = self.adb.install(device_id, apk_path, replace=True, timeout=300)
             if not success:
-                self.retry_progress.emit(device_id, "error", f"重试失败：{msg}")
-                return device_id, False, msg
+                self.retry_progress.emit(device_id, "error", f"{apk_name} 重试失败：{msg}")
+                return device_id, False, f"{apk_name}: {msg}"
         
         self.retry_progress.emit(device_id, "success", "重试成功 ✓")
         return device_id, True, "重试成功"
@@ -831,14 +886,14 @@ class RetryInstallThread(QThread):
 
 
 class CheckVersionThread(QThread):
-    """检查已安装版本的线程"""
+    """检查已安装版本的线程 — 支持多包名"""
     version_checked = pyqtSignal(str, str, int)
     finished = pyqtSignal()
     
-    def __init__(self, devices, package_name, adb):
+    def __init__(self, devices, package_names, adb):
         super().__init__()
         self.devices = devices
-        self.package_name = package_name
+        self.package_names = package_names if isinstance(package_names, list) else [package_names]
         self.adb = adb
         self.stop_flag = False
     
@@ -847,17 +902,45 @@ class CheckVersionThread(QThread):
             if self.stop_flag:
                 break
             device_id = device["id"]
-            version = self.adb.get_installed_version(device_id, self.package_name)
-            version_str = f"v{version}" if version else "未安装"
-            version_code = 0
-            success, stdout, _ = self.adb._run_adb(
-                device_id, "shell", "dumpsys", "package", self.package_name, timeout=30
-            )
-            if success and stdout:
-                match = re.search(r'versionCode=(\d+)', stdout)
-                if match:
-                    version_code = int(match.group(1))
-            self.version_checked.emit(device_id, version_str, version_code)
+            # 对每个包名检查版本，显示最后一个包名的结果
+            all_versions = []
+            last_version_code = 0
+            for pkg in self.package_names:
+                if not pkg:
+                    continue
+                version = self.adb.get_installed_version(device_id, pkg)
+                version_code = 0
+                success, stdout, _ = self.adb._run_adb(
+                    device_id, "shell", "dumpsys", "package", pkg, timeout=30
+                )
+                if success and stdout:
+                    match = re.search(r'versionCode=(\d+)', stdout)
+                    if match:
+                        version_code = int(match.group(1))
+                if version:
+                    all_versions.append(f"{pkg}: v{version}")
+                    last_version_code = version_code
+                else:
+                    all_versions.append(f"{pkg}: 未安装")
+            
+            if len(self.package_names) == 1:
+                # 单包名：保持原有格式
+                pkg = self.package_names[0]
+                version = self.adb.get_installed_version(device_id, pkg)
+                version_str = f"v{version}" if version else "未安装"
+                version_code = 0
+                success, stdout, _ = self.adb._run_adb(
+                    device_id, "shell", "dumpsys", "package", pkg, timeout=30
+                )
+                if success and stdout:
+                    match = re.search(r'versionCode=(\d+)', stdout)
+                    if match:
+                        version_code = int(match.group(1))
+                self.version_checked.emit(device_id, version_str, version_code)
+            else:
+                # 多包名：显示汇总
+                version_str = " | ".join(all_versions) if all_versions else "未安装"
+                self.version_checked.emit(device_id, version_str, last_version_code)
         self.finished.emit()
     
     def stop(self):
@@ -865,7 +948,7 @@ class CheckVersionThread(QThread):
 
 
 class DeviceDetailDialog(QDialog):
-    """设备详情对话框 #21"""
+    """设备详情对话框 #21 — 异步加载"""
     
     def __init__(self, device_id, adb, parent=None):
         super().__init__(parent)
@@ -923,16 +1006,36 @@ class DeviceDetailDialog(QDialog):
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
         
-        # 异步加载详细信息
-        self.load_details()
+        # 异步加载详细信息（不阻塞UI）
+        self._load_thread = None
+        QTimer.singleShot(50, self._async_load_details)
     
-    def load_details(self):
-        """加载设备详细信息"""
-        info = self.adb.get_device_info(self.device_id)
+    def _async_load_details(self):
+        """在后台线程加载设备详细信息"""
+        import threading
+        
+        class DetailLoader(QThread):
+            loaded = pyqtSignal(dict, dict)
+            
+            def __init__(self, device_id, adb):
+                super().__init__()
+                self.device_id = device_id
+                self.adb = adb
+            
+            def run(self):
+                info = self.adb.get_device_info(self.device_id)
+                detail = self.adb.get_device_detail(self.device_id)
+                self.loaded.emit(info, detail)
+        
+        self._loader = DetailLoader(self.device_id, self.adb)
+        self._loader.loaded.connect(self._update_ui)
+        self._loader.start()
+    
+    def _update_ui(self, info, detail):
+        """在主线程更新UI"""
         self.info_labels["型号"].setText(info.get("model", "未知"))
         self.info_labels["Android版本"].setText(info.get("version", "未知"))
         
-        detail = self.adb.get_device_detail(self.device_id)
         self.info_labels["电量"].setText(
             detail.get('battery', '未知') + 
             (f" ({detail.get('battery_status', '')})" if 'battery_status' in detail else '')
@@ -961,6 +1064,7 @@ class ADBBatchManager(QMainWindow):
         self.retry_stats = {"success": 0, "failure": 0}
         self.install_results = []  # 用于导出CSV #22
         self.apk_paths = []  # 多APK支持 #17
+        self.apk_info_list = []  # 多APK详情 [{path, package, version_code, version_name}, ...]
         self.dark_mode = False  # 深色主题 #23
         
         # 配置持久化 #16
@@ -1025,9 +1129,9 @@ class ADBBatchManager(QMainWindow):
         self.ip_end_edit.setText(self.settings.value("ip_end", "192.168.1.200"))
         self.port_edit.setText(self.settings.value("port", "5555"))
         self.scan_threads.setValue(int(self.settings.value("scan_threads", 20)))
-        self.install_threads.setValue(int(self.settings.value("install_threads", 10)))
+        self.install_threads.setValue(int(self.settings.value("install_threads", 30)))
         self.version_policy.setCurrentIndex(int(self.settings.value("version_policy", 0)))
-        self.uninstall_threads.setValue(int(self.settings.value("uninstall_threads", 10)))
+        self.uninstall_threads.setValue(int(self.settings.value("uninstall_threads", 30)))
         
         # 深色主题
         dark = self.settings.value("dark_mode", False, type=bool)
@@ -1050,68 +1154,80 @@ class ADBBatchManager(QMainWindow):
         self.save_settings()
         super().closeEvent(event)
     
+
     def create_scan_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(6)
         
+        # ── 扫描设置：两行布局 ──
         scan_group = QGroupBox("扫描设置")
-        scan_layout = QHBoxLayout(scan_group)
+        scan_grid = QVBoxLayout(scan_group)
+        scan_grid.setSpacing(8)
         
-        # IP 范围
-        ip_layout = QVBoxLayout()
-        ip_layout.addWidget(QLabel("起始 IP (完整地址):"))
+        # 第一行：IP 范围
+        row1 = QHBoxLayout()
+        row1.setSpacing(12)
+        row1.addWidget(QLabel("起始 IP:"))
         self.ip_start_edit = QLineEdit()
         self.ip_start_edit.setPlaceholderText("例如：192.168.1.100")
-        ip_layout.addWidget(self.ip_start_edit)
+        self.ip_start_edit.setToolTip("扫描的起始IP地址，支持跨网段扫描\n例如：192.168.1.100")
+        row1.addWidget(self.ip_start_edit, 3)
         
-        ip_layout.addWidget(QLabel("结束 IP (完整地址):"))
+        row1.addWidget(QLabel("结束 IP:"))
         self.ip_end_edit = QLineEdit()
         self.ip_end_edit.setPlaceholderText("例如：192.168.2.255")
-        ip_layout.addWidget(self.ip_end_edit)
+        self.ip_end_edit.setToolTip("扫描的结束IP地址\n可跨网段，如 192.168.2.255\n单IP时起始和结束填一样")
+        row1.addWidget(self.ip_end_edit, 3)
+        scan_grid.addLayout(row1)
         
-        # 端口设置 #20 — 支持多端口
-        port_layout = QVBoxLayout()
-        port_layout.addWidget(QLabel("ADB 端口 (支持多端口):"))
+        # 第二行：端口 + 并发 + 按钮
+        row2 = QHBoxLayout()
+        row2.setSpacing(12)
+        row2.addWidget(QLabel("ADB 端口:"))
         self.port_edit = QLineEdit()
         self.port_edit.setPlaceholderText("5555 或 5555,5556-5558")
         self.port_edit.setText("5555")
-        port_layout.addWidget(self.port_edit)
-        port_tip = QLabel("格式：5555 或 5555,5556-5558")
-        port_tip.setStyleSheet("color: #999; font-size: 10px;")
-        port_layout.addWidget(port_tip)
+        self.port_edit.setToolTip("ADB连接端口，支持以下格式：\n• 单端口：5555\n• 多端口（逗号分隔）：5555,5556,5557\n• 端口范围（连字符）：5555-5558\n• 混合格式：5555,5556-5558")
+        row2.addWidget(self.port_edit, 3)
         
-        # 并发数
-        thread_layout = QVBoxLayout()
-        thread_layout.addWidget(QLabel("最大并发数:"))
+        row2.addWidget(QLabel("并发数:"))
         self.scan_threads = QSpinBox()
         self.scan_threads.setRange(1, 200)
         self.scan_threads.setValue(20)
-        thread_layout.addWidget(self.scan_threads)
+        self.scan_threads.setFixedWidth(80)
+        self.scan_threads.setToolTip("同时扫描的最大线程数\n• 局域网建议：20-50\n• 跨网段/大量IP建议：50-100\n• 数值越大扫描越快，但占用资源越多")
+        row2.addWidget(self.scan_threads)
         
-        scan_layout.addLayout(ip_layout)
-        scan_layout.addLayout(port_layout)
-        scan_layout.addLayout(thread_layout)
-        scan_layout.addStretch()
-        
+        row2.addSpacing(16)
         self.scan_btn = QPushButton("🔍 开始扫描")
         self.scan_btn.clicked.connect(self.start_scan)
-        self.scan_btn.setFixedWidth(150)
-        self.scan_btn.setStyleSheet("QPushButton { font-size: 14px; font-weight: bold; }")
-        scan_layout.addWidget(self.scan_btn)
+        self.scan_btn.setMinimumWidth(130)
+        self.scan_btn.setStyleSheet("QPushButton { font-size: 14px; font-weight: bold; padding: 6px 16px; }")
+        row2.addWidget(self.scan_btn)
         
         self.stop_scan_btn = QPushButton("⏹️ 停止")
         self.stop_scan_btn.clicked.connect(self.stop_scan)
         self.stop_scan_btn.setEnabled(False)
-        self.stop_scan_btn.setFixedWidth(100)
-        scan_layout.addWidget(self.stop_scan_btn)
+        self.stop_scan_btn.setMinimumWidth(90)
+        row2.addWidget(self.stop_scan_btn)
+        
+        scan_grid.addLayout(row2)
+        
+        # 端口格式提示（单独一行，靠左）
+        port_tip = QLabel("💡 端口格式：5555 | 5555,5557 | 5555-5558 | 5555,5557-5560")
+        port_tip.setStyleSheet("color: #888; font-size: 11px;")
+        port_tip.setWordWrap(True)
+        scan_grid.addWidget(port_tip)
         
         layout.addWidget(scan_group)
         
+        # ── 扫描进度 ──
         self.scan_progress = QProgressBar()
         self.scan_progress.setVisible(False)
         layout.addWidget(self.scan_progress)
         
-        # 设备搜索 #14
+        # ── 设备搜索 #14 ──
         search_layout = QHBoxLayout()
         search_layout.addWidget(QLabel("🔍 搜索:"))
         self.device_search_edit = QLineEdit()
@@ -1120,6 +1236,7 @@ class ADBBatchManager(QMainWindow):
         search_layout.addWidget(self.device_search_edit)
         layout.addLayout(search_layout)
         
+        # ── 设备列表 ──
         self.device_table = QTableWidget()
         self.device_table.setColumnCount(6)
         self.device_table.setHorizontalHeaderLabels(["选择", "IP:端口", "状态", "型号", "Android 版本", "操作"])
@@ -1128,6 +1245,7 @@ class ADBBatchManager(QMainWindow):
         self.device_table.doubleClicked.connect(self.on_device_double_clicked)  # #21 设备详情
         layout.addWidget(self.device_table)
         
+        # ── 底部按钮行 ──
         btn_layout = QHBoxLayout()
         self.device_count_label = QLabel("已发现 0 台设备")
         self.device_count_label.setStyleSheet("font-weight: bold; font-size: 12px;")
@@ -1153,60 +1271,87 @@ class ADBBatchManager(QMainWindow):
     def create_install_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(6)
         
-        # APK 选择 — 支持多文件 #17
-        apk_group = QGroupBox("APK 文件（支持多文件）")
+        # ── 上半部分：设置区域（左右分栏） ──
+        top_layout = QHBoxLayout()
+        top_layout.setSpacing(8)
+        
+        # 左侧：APK选择 + 应用信息
+        left_col = QVBoxLayout()
+        left_col.setSpacing(6)
+        
+        # APK 选择
+        apk_group = QGroupBox("APK 文件（支持多选）")
         apk_layout = QVBoxLayout(apk_group)
+        apk_layout.setSpacing(4)
         
         apk_row = QHBoxLayout()
         self.apk_path_edit = QLineEdit()
-        self.apk_path_edit.setPlaceholderText("选择要安装的 APK 文件（可多选）...")
-        apk_row.addWidget(self.apk_path_edit)
+        self.apk_path_edit.setPlaceholderText("点击「浏览」选择 APK 文件...")
+        self.apk_path_edit.setToolTip("支持选择多个APK文件同时安装\n按住Ctrl多选，按住Shift范围选\n多APK将按顺序依次安装到每台设备")
+        apk_row.addWidget(self.apk_path_edit, 1)
         
         browse_btn = QPushButton("浏览...")
+        browse_btn.setFixedWidth(70)
         browse_btn.clicked.connect(self.browse_apk)
         apk_row.addWidget(browse_btn)
         apk_layout.addLayout(apk_row)
         
-        # 多APK列表显示
         self.apk_list_label = QLabel("")
-        self.apk_list_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.apk_list_label.setStyleSheet("color: #888; font-size: 11px;")
         self.apk_list_label.setWordWrap(True)
         apk_layout.addWidget(self.apk_list_label)
         
-        layout.addWidget(apk_group)
+        left_col.addWidget(apk_group)
         
-        # 包名和版本信息
+        # 应用信息
         pkg_group = QGroupBox("应用信息")
         pkg_layout = QVBoxLayout(pkg_group)
+        pkg_layout.setSpacing(4)
         
         pkg_row = QHBoxLayout()
         pkg_row.addWidget(QLabel("包名:"))
         self.package_name_edit = QLineEdit()
-        self.package_name_edit.setPlaceholderText("例如：com.example.app")
-        pkg_row.addWidget(self.package_name_edit)
+        self.package_name_edit.setPlaceholderText("选APK后自动识别，或手动输入")
+        self.package_name_edit.setToolTip("应用的包名（Package Name）\n• 选择APK文件后会自动识别\n• 也可手动输入，用于版本对比检测\n• 格式如：com.company.appname")
+        pkg_row.addWidget(self.package_name_edit, 1)
         pkg_layout.addLayout(pkg_row)
         
         self.package_name_edit.textChanged.connect(self.on_package_name_changed)
         
         self.version_info_label = QLabel("APK 版本信息：未选择文件")
-        self.version_info_label.setStyleSheet("color: #666; font-style: italic;")
+        self.version_info_label.setStyleSheet("color: #888; font-size: 11px;")
         pkg_layout.addWidget(self.version_info_label)
-        layout.addWidget(pkg_group)
         
-        # 安装设置
+        left_col.addWidget(pkg_group)
+        left_col.addStretch()
+        
+        top_layout.addLayout(left_col, 2)
+        
+        # 右侧：安装设置
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
+        
         install_group = QGroupBox("安装设置")
         install_layout = QVBoxLayout(install_group)
+        install_layout.setSpacing(8)
         
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("最大并发数:"))
+        # 并发数
+        row_threads = QHBoxLayout()
+        row_threads.addWidget(QLabel("安装并发数:"))
         self.install_threads = QSpinBox()
-        self.install_threads.setRange(1, 50)
-        self.install_threads.setValue(10)
-        row1.addWidget(self.install_threads)
+        self.install_threads.setRange(1, 100)
+        self.install_threads.setValue(30)
+        self.install_threads.setFixedWidth(80)
+        self.install_threads.setToolTip("同时安装的最大设备数\n• 建议：5-30\n• 数值过大可能导致设备卡顿")
+        row_threads.addWidget(self.install_threads)
+        row_threads.addStretch()
+        install_layout.addLayout(row_threads)
         
-        row1.addSpacing(30)
-        row1.addWidget(QLabel("全局策略:"))
+        # 策略
+        row_policy = QHBoxLayout()
+        row_policy.addWidget(QLabel("安装策略:"))
         self.version_policy = QComboBox()
         self.version_policy.addItems([
             "智能对比 (版本一致或更高则跳过)",
@@ -1214,26 +1359,33 @@ class ADBBatchManager(QMainWindow):
             "强制覆盖 (始终安装)"
         ])
         self.version_policy.setCurrentIndex(0)
-        row1.addWidget(self.version_policy)
-        row1.addStretch()
-        install_layout.addLayout(row1)
+        self.version_policy.setToolTip("全局安装策略，可在设备列表中单独覆盖\n• 智能对比：检测已安装版本，新版本才装\n• 跳过已安装：只要有就跳过\n• 强制覆盖：不管有没有都装")
+        row_policy.addWidget(self.version_policy, 1)
+        install_layout.addLayout(row_policy)
         
         self.version_policy_tip = QLabel("💡 智能对比：自动检测已安装版本，只有新版本才会安装")
         self.version_policy_tip.setStyleSheet("color: #0066cc; font-size: 11px;")
+        self.version_policy_tip.setWordWrap(True)
         install_layout.addWidget(self.version_policy_tip)
         self.version_policy.currentIndexChanged.connect(self.on_version_policy_changed)
         
-        layout.addWidget(install_group)
+        right_col.addWidget(install_group)
+        right_col.addStretch()
         
-        # 设备选择和版本对比
+        top_layout.addLayout(right_col, 3)
+        
+        layout.addLayout(top_layout)
+        
+        # ── 设备列表与版本对比 ──
         device_group = QGroupBox("设备列表与版本对比")
         device_layout = QVBoxLayout(device_group)
+        device_layout.setSpacing(4)
         
         refresh_row = QHBoxLayout()
         refresh_row.addStretch()
         self.refresh_version_btn = QPushButton("🔄 刷新版本")
         self.refresh_version_btn.clicked.connect(self.on_refresh_version_clicked)
-        self.refresh_version_btn.setFixedWidth(120)
+        self.refresh_version_btn.setFixedWidth(110)
         self.refresh_version_btn.setStyleSheet("QPushButton { font-size: 12px; background-color: #2196F3; color: white; padding: 5px; }")
         refresh_row.addWidget(self.refresh_version_btn)
         device_layout.addLayout(refresh_row)
@@ -1244,20 +1396,22 @@ class ADBBatchManager(QMainWindow):
             "选择", "设备", "已安装版本", "APK 版本", "策略"
         ])
         self.install_device_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.install_device_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Interactive)
+        self.install_device_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.install_device_table.setColumnWidth(0, 50)
+        self.install_device_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         device_layout.addWidget(self.install_device_table)
         
         strategy_tip = QLabel("💡 可在表格中为每台设备单独设置策略")
-        strategy_tip.setStyleSheet("color: #999; font-size: 10px;")
+        strategy_tip.setStyleSheet("color: #888; font-size: 11px;")
         device_layout.addWidget(strategy_tip)
         
-        layout.addWidget(device_group)
+        layout.addWidget(device_group, 1)
         
-        # 安装按钮和进度
+        # ── 安装按钮和进度 ──
         btn_layout = QHBoxLayout()
         self.install_btn = QPushButton("📦 开始安装")
         self.install_btn.clicked.connect(self.start_install)
-        self.install_btn.setFixedWidth(150)
+        self.install_btn.setMinimumWidth(140)
         self.install_btn.setStyleSheet("QPushButton { font-size: 14px; font-weight: bold; background-color: #4CAF50; color: white; padding: 8px; }")
         btn_layout.addWidget(self.install_btn)
         
@@ -1276,43 +1430,42 @@ class ADBBatchManager(QMainWindow):
         self.install_progress_bar = QProgressBar()
         layout.addWidget(self.install_progress_bar)
         
+        # 结果 + 导出
+        result_row = QHBoxLayout()
         self.install_result_label = QLabel("✅ 成功：0 | ❌ 失败：0 | ⏭️ 跳过：0")
         self.install_result_label.setStyleSheet("font-size: 13px; font-weight: bold;")
-        layout.addWidget(self.install_result_label)
+        result_row.addWidget(self.install_result_label)
+        result_row.addStretch()
         
-        # 导出报告 #22
-        export_layout = QHBoxLayout()
         self.export_csv_btn = QPushButton("📊 导出CSV报告")
         self.export_csv_btn.clicked.connect(self.export_install_csv)
         self.export_csv_btn.setEnabled(False)
         self.export_csv_btn.setStyleSheet("QPushButton { padding: 5px 15px; }")
-        export_layout.addWidget(self.export_csv_btn)
-        export_layout.addStretch()
+        result_row.addWidget(self.export_csv_btn)
         
         self.retry_tip_label = QLabel("💡 安装失败的设备会自动出现在「失败重试」标签页")
         self.retry_tip_label.setStyleSheet("color: #ff6600; font-size: 11px;")
-        export_layout.addWidget(self.retry_tip_label)
-        layout.addLayout(export_layout)
+        result_row.addWidget(self.retry_tip_label)
+        
+        layout.addLayout(result_row)
         
         return widget
     
     def create_retry_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(6)
         
-        tip_group = QGroupBox("使用说明")
-        tip_layout = QVBoxLayout(tip_group)
-        tip1 = QLabel("⚠️ 此页面显示上次安装失败的设备")
-        tip1.setStyleSheet("color: #cc0000; font-weight: bold;")
-        tip_layout.addWidget(tip1)
-        tip2 = QLabel("• 可以选择部分或全部失败设备重新尝试安装")
-        tip2.setStyleSheet("color: #666;")
-        tip_layout.addWidget(tip2)
-        tip3 = QLabel("• 重试前会自动卸载旧版本，然后重新安装")
-        tip3.setStyleSheet("color: #666;")
-        tip_layout.addWidget(tip3)
-        layout.addWidget(tip_group)
+        # 简洁提示（不占太多空间）
+        tip_row = QHBoxLayout()
+        tip_label = QLabel("⚠️ 此页面显示上次安装失败的设备，重试前会自动卸载旧版本")
+        tip_label.setStyleSheet("color: #cc6600; font-size: 12px; font-weight: bold;")
+        tip_label.setWordWrap(True)
+        tip_row.addWidget(tip_label)
+        tip_row.addStretch()
+        layout.addLayout(tip_row)
         
+        # 失败设备列表
         device_group = QGroupBox("失败设备列表")
         device_layout = QVBoxLayout(device_group)
         
@@ -1322,12 +1475,13 @@ class ADBBatchManager(QMainWindow):
         self.retry_device_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         device_layout.addWidget(self.retry_device_table)
         
-        layout.addWidget(device_group)
+        layout.addWidget(device_group, 1)
         
+        # 按钮和进度
         btn_layout = QHBoxLayout()
         self.retry_btn = QPushButton("🔄 重试选中设备")
         self.retry_btn.clicked.connect(self.start_retry)
-        self.retry_btn.setFixedWidth(180)
+        self.retry_btn.setMinimumWidth(160)
         self.retry_btn.setStyleSheet("QPushButton { font-size: 14px; font-weight: bold; background-color: #ff9800; color: white; padding: 8px; }")
         btn_layout.addWidget(self.retry_btn)
         
@@ -1335,8 +1489,8 @@ class ADBBatchManager(QMainWindow):
         self.stop_retry_btn.clicked.connect(self.stop_retry)
         self.stop_retry_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_retry_btn)
-        
         btn_layout.addStretch()
+        
         self.retry_progress_label = QLabel("准备就绪")
         btn_layout.addWidget(self.retry_progress_label)
         
@@ -1354,39 +1508,47 @@ class ADBBatchManager(QMainWindow):
     def create_uninstall_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(6)
         
-        pkg_group = QGroupBox("要卸载的应用")
-        pkg_layout = QVBoxLayout(pkg_group)
+        # ── 上部：卸载设置 ──
+        settings_group = QGroupBox("卸载设置")
+        settings_layout = QVBoxLayout(settings_group)
+        settings_layout.setSpacing(8)
         
-        pkg_row1 = QHBoxLayout()
-        pkg_row1.addWidget(QLabel("应用包名:"))
+        # 包名输入行
+        pkg_row = QHBoxLayout()
+        pkg_row.addWidget(QLabel("应用包名:"))
         self.uninstall_package_edit = QLineEdit()
         self.uninstall_package_edit.setPlaceholderText("例如：com.example.app")
-        pkg_row1.addWidget(self.uninstall_package_edit)
+        self.uninstall_package_edit.setToolTip("要卸载的应用包名\n• 可点击「查询已安装」获取包名列表\n• 格式如：com.company.appname")
+        pkg_row.addWidget(self.uninstall_package_edit, 1)
         
         query_installed_btn = QPushButton("📋 查询已安装")
         query_installed_btn.setFixedWidth(110)
         query_installed_btn.setToolTip("从选中设备查询已安装的第三方应用列表")
         query_installed_btn.clicked.connect(self.query_installed_apps)
-        pkg_row1.addWidget(query_installed_btn)
-        pkg_layout.addLayout(pkg_row1)
+        pkg_row.addWidget(query_installed_btn)
+        settings_layout.addLayout(pkg_row)
         
-        pkg_tip = QLabel("💡 提示：请输入完整的应用包名")
-        pkg_tip.setStyleSheet("color: #666; font-size: 11px;")
-        pkg_layout.addWidget(pkg_tip)
+        pkg_tip = QLabel("💡 可点击「查询已安装」从设备获取包名")
+        pkg_tip.setStyleSheet("color: #888; font-size: 11px;")
+        settings_layout.addWidget(pkg_tip)
         
-        layout.addWidget(pkg_group)
-        
-        uninstall_group = QGroupBox("卸载设置")
-        uninstall_layout = QHBoxLayout(uninstall_group)
-        uninstall_layout.addWidget(QLabel("最大并发数:"))
+        # 并发数
+        thread_row = QHBoxLayout()
+        thread_row.addWidget(QLabel("卸载并发数:"))
         self.uninstall_threads = QSpinBox()
-        self.uninstall_threads.setRange(1, 50)
-        self.uninstall_threads.setValue(10)
-        uninstall_layout.addWidget(self.uninstall_threads)
-        uninstall_layout.addStretch()
-        layout.addWidget(uninstall_group)
+        self.uninstall_threads.setRange(1, 100)
+        self.uninstall_threads.setValue(30)
+        self.uninstall_threads.setFixedWidth(80)
+        self.uninstall_threads.setToolTip("同时卸载的最大设备数\n• 建议：5-30")
+        thread_row.addWidget(self.uninstall_threads)
+        thread_row.addStretch()
+        settings_layout.addLayout(thread_row)
         
+        layout.addWidget(settings_group)
+        
+        # ── 设备列表 ──
         device_group = QGroupBox("选择设备")
         device_layout = QVBoxLayout(device_group)
         self.uninstall_device_table = QTableWidget()
@@ -1394,12 +1556,13 @@ class ADBBatchManager(QMainWindow):
         self.uninstall_device_table.setHorizontalHeaderLabels(["选择", "设备"])
         self.uninstall_device_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         device_layout.addWidget(self.uninstall_device_table)
-        layout.addWidget(device_group)
+        layout.addWidget(device_group, 1)
         
+        # ── 按钮和进度 ──
         btn_layout = QHBoxLayout()
         self.uninstall_btn = QPushButton("🗑️ 开始卸载")
         self.uninstall_btn.clicked.connect(self.start_uninstall)
-        self.uninstall_btn.setFixedWidth(150)
+        self.uninstall_btn.setMinimumWidth(140)
         self.uninstall_btn.setStyleSheet("QPushButton { font-size: 14px; font-weight: bold; background-color: #f44336; color: white; padding: 8px; }")
         btn_layout.addWidget(self.uninstall_btn)
         
@@ -1423,7 +1586,7 @@ class ADBBatchManager(QMainWindow):
         layout.addWidget(self.uninstall_result_label)
         
         return widget
-    
+
     def create_log_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -1788,47 +1951,89 @@ class ADBBatchManager(QMainWindow):
             self.apk_paths = file_paths
             self.apk_path_edit.setText(file_paths[0])
             
-            if len(file_paths) > 1:
-                names = [os.path.basename(p) for p in file_paths]
-                self.apk_list_label.setText(f"📦 已选择 {len(file_paths)} 个APK：{'、'.join(names)}")
-                self.log(f"已选择 {len(file_paths)} 个 APK：{', '.join(names)}")
-            else:
-                self.apk_list_label.setText("")
-            
-            # 解析第一个APK的版本和包名
-            self._parse_apk_info(file_paths[0])
+            # 解析所有APK的包名和版本
+            self._parse_all_apk_info(file_paths)
             
             self.save_settings()
     
-    def _parse_apk_info(self, file_path):
-        """解析APK版本和包名信息"""
-        self.log(f"已选择 APK: {file_path}")
-        try:
-            version_code, version_name, pkg_name = self.adb.get_apk_version(file_path)
-            self.log(f"APK 解析结果：code={version_code}, name={version_name}, package={pkg_name}")
+    def _parse_all_apk_info(self, file_paths):
+        """解析所有APK的版本和包名信息"""
+        self.apk_info_list = []
+        all_success = True
+        
+        for file_path in file_paths:
+            self.log(f"已选择 APK: {file_path}")
+            try:
+                version_code, version_name, pkg_name = self.adb.get_apk_version(file_path)
+                self.log(f"APK 解析结果：code={version_code}, name={version_name}, package={pkg_name}")
+                
+                if not pkg_name:
+                    all_success = False
+                    self.log(f"⚠ 无法识别包名：{os.path.basename(file_path)}")
+                
+                self.apk_info_list.append({
+                    "path": file_path,
+                    "package": pkg_name or "",
+                    "version_code": version_code,
+                    "version_name": version_name or ""
+                })
+            except Exception as e:
+                all_success = False
+                self.apk_info_list.append({
+                    "path": file_path,
+                    "package": "",
+                    "version_code": None,
+                    "version_name": ""
+                })
+                self.log(f"✗ APK 解析错误：{e}")
+        
+        # 更新UI
+        if len(file_paths) == 1:
+            # 单APK：回填包名到输入框
+            info = self.apk_info_list[0]
+            if info["package"] and not self.package_name_edit.text().strip():
+                self.package_name_edit.setText(info["package"])
+                self.log(f"✓ 已自动填入包名：{info['package']}")
             
-            if pkg_name and not self.package_name_edit.text().strip():
-                self.package_name_edit.setText(pkg_name)
-                self.log(f"✓ 已自动填入包名：{pkg_name}")
-            
-            if version_code or version_name:
-                version_str = f"APK 版本：v{version_name or ''} (code: {version_code or 'N/A'})"
-                if pkg_name:
-                    version_str += f"  包名：{pkg_name}"
+            if info["version_code"] or info["version_name"]:
+                version_str = f"APK 版本：v{info['version_name']} (code: {info['version_code'] or 'N/A'})"
+                if info["package"]:
+                    version_str += f"  包名：{info['package']}"
                 self.version_info_label.setText(version_str)
                 self.version_info_label.setStyleSheet("color: #006600; font-weight: bold;")
-                
-                apk_version = f"v{version_name or version_code}"
+                apk_version = f"v{info['version_name'] or info['version_code']}"
                 for row in range(self.install_device_table.rowCount()):
                     item = QTableWidgetItem(apk_version)
                     item.setForeground(QColor("#006600"))
                     self.install_device_table.setItem(row, 3, item)
             else:
                 self.version_info_label.setText("APK 版本信息：无法读取")
-                self.log("⚠ APK 版本解析失败")
-        except Exception as e:
-            self.version_info_label.setText("APK 版本信息：解析错误")
-            self.log(f"✗ APK 版本解析错误：{e}")
+            self.apk_list_label.setText("")
+        else:
+            # 多APK：显示列表
+            lines = []
+            for i, info in enumerate(self.apk_info_list):
+                name = os.path.basename(info["path"])
+                pkg = info["package"] or "未知包名"
+                ver = f"v{info['version_name']}" if info["version_name"] else "未知版本"
+                lines.append(f"{i+1}. {name} — {pkg} ({ver})")
+            
+            self.apk_list_label.setText("📦 已选择 " + str(len(file_paths)) + " 个APK：\n" + "\n".join(lines))
+            self.apk_list_label.setStyleSheet("color: #888; font-size: 11px;")
+            
+            # 多APK时包名输入框显示提示
+            packages = [info["package"] for info in self.apk_info_list if info["package"]]
+            if packages:
+                self.package_name_edit.setPlaceholderText(f"自动识别：{', '.join(packages[:3])}{'...' if len(packages) > 3 else ''}")
+            
+            # 版本信息区显示摘要
+            self.version_info_label.setText(f"共 {len(file_paths)} 个APK，包名/版本已自动识别")
+            self.version_info_label.setStyleSheet("color: #006600; font-weight: bold;")
+            
+            self.log(f"已选择 {len(file_paths)} 个 APK")
+            
+            if not all_success:
+                self.log("⚠ 部分APK解析失败，版本对比可能不准确")
     
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -1848,28 +2053,34 @@ class ADBBatchManager(QMainWindow):
             self.apk_paths = apk_files
             self.apk_path_edit.setText(apk_files[0])
             
-            if len(apk_files) > 1:
-                names = [os.path.basename(p) for p in apk_files]
-                self.apk_list_label.setText(f"📦 已拖入 {len(apk_files)} 个APK：{'、'.join(names)}")
-                self.log(f"已拖入 {len(apk_files)} 个 APK")
-            else:
-                self.apk_list_label.setText("")
-            
-            self._parse_apk_info(apk_files[0])
+            # 解析所有APK
+            self._parse_all_apk_info(apk_files)
     
-    def check_installed_versions(self, package_name=None):
-        if package_name is None:
-            package_name = self.package_name_edit.text().strip()
-        if not package_name or not self.devices:
+    def check_installed_versions(self, package_names=None):
+        # 获取要检查的包名列表
+        if package_names is None:
+            # 从apk_info_list获取包名，或从输入框获取
+            if self.apk_info_list:
+                package_names = [info["package"] for info in self.apk_info_list if info["package"]]
+            else:
+                pkg = self.package_name_edit.text().strip()
+                package_names = [pkg] if pkg else []
+        elif isinstance(package_names, str):
+            package_names = [package_names]
+        
+        # 过滤空包名
+        package_names = [p for p in package_names if p]
+        if not package_names or not self.devices:
             return
         
-        self.log(f"🔄 开始检测 {len(self.devices)} 台设备的已安装版本 (包名：{package_name})...")
+        pkg_display = ', '.join(package_names[:3]) + ('...' if len(package_names) > 3 else '')
+        self.log(f"🔄 开始检测 {len(self.devices)} 台设备的已安装版本 (包名：{pkg_display})...")
         
         if hasattr(self, 'check_version_thread') and self.check_version_thread.isRunning():
             self.check_version_thread.stop()
             self.check_version_thread.wait()
         
-        self.check_version_thread = CheckVersionThread(self.devices, package_name, self.adb)
+        self.check_version_thread = CheckVersionThread(self.devices, package_names, self.adb)
         self.check_version_thread.version_checked.connect(self.update_installed_version)
         self.check_version_thread.finished.connect(self.on_check_versions_finished)
         self.check_version_thread.start()
@@ -1886,22 +2097,20 @@ class ADBBatchManager(QMainWindow):
                         item.setForeground(QColor("#0066cc"))
                     self.install_device_table.setItem(row, 2, item)
                     
-                    policy_combo = self.install_device_table.cellWidget(row, 4)
-                    if policy_combo:
-                        apk_path = self.apk_path_edit.text().strip()
-                        apk_code = None
-                        if apk_path and os.path.exists(apk_path):
-                            apk_code, _, _ = self.adb.get_apk_version(apk_path)
-                        
-                        if version == "未安装":
-                            policy_combo.setCurrentIndex(0)
-                        elif apk_code and installed_code:
-                            if apk_code > installed_code:
+                    # 单APK时自动设置策略
+                    if self.apk_info_list and len(self.apk_info_list) == 1:
+                        policy_combo = self.install_device_table.cellWidget(row, 4)
+                        if policy_combo:
+                            apk_code = self.apk_info_list[0].get("version_code")
+                            if version == "未安装":
                                 policy_combo.setCurrentIndex(0)
+                            elif apk_code and installed_code:
+                                if apk_code > installed_code:
+                                    policy_combo.setCurrentIndex(0)
+                                else:
+                                    policy_combo.setCurrentIndex(1)
                             else:
-                                policy_combo.setCurrentIndex(1)
-                        else:
-                            policy_combo.setCurrentIndex(0)
+                                policy_combo.setCurrentIndex(0)
                     break
     
     def on_check_versions_finished(self):
@@ -1909,23 +2118,37 @@ class ADBBatchManager(QMainWindow):
     
     def start_install(self):
         apk_path = self.apk_path_edit.text().strip()
-        package_name = self.package_name_edit.text().strip()
         
         if not apk_path:
             QMessageBox.warning(self, "错误", "请选择 APK 文件")
             return
-        if not package_name:
-            QMessageBox.warning(self, "错误", "请输入应用包名")
-            return
         
-        # 验证所有APK文件存在
-        for p in self.apk_paths:
-            if not os.path.exists(p):
-                QMessageBox.warning(self, "错误", f"APK 文件不存在：{p}")
+        # 检查APK信息
+        if not self.apk_info_list:
+            # 没有解析过（可能是旧数据），尝试解析
+            if self.apk_paths:
+                self._parse_all_apk_info(self.apk_paths)
+            else:
+                self.apk_info_list = [{
+                    "path": apk_path,
+                    "package": self.package_name_edit.text().strip(),
+                    "version_code": None,
+                    "version_name": ""
+                }]
+        
+        # 验证APK文件存在
+        for info in self.apk_info_list:
+            if not os.path.exists(info["path"]):
+                QMessageBox.warning(self, "错误", f"APK 文件不存在：{info['path']}")
                 return
         
-        if not self.apk_paths:
-            self.apk_paths = [apk_path]
+        # 单APK时检查包名
+        if len(self.apk_info_list) == 1 and not self.apk_info_list[0]["package"]:
+            pkg = self.package_name_edit.text().strip()
+            if not pkg:
+                QMessageBox.warning(self, "错误", "请输入应用包名")
+                return
+            self.apk_info_list[0]["package"] = pkg
         
         selected_devices = []
         for row in range(self.install_device_table.rowCount()):
@@ -1940,6 +2163,7 @@ class ADBBatchManager(QMainWindow):
         self.install_stats = {"success": 0, "failure": 0, "skipped": 0}
         self.install_results = []  # 清空导出数据 #22
         self.failed_devices = []
+        self.install_selected_count = len(selected_devices)  # 用于进度条 #5
         self.install_result_label.setText("✅ 成功：0 | ❌ 失败：0 | ⏭️ 跳过：0")
         
         max_threads = self.install_threads.value()
@@ -1950,15 +2174,17 @@ class ADBBatchManager(QMainWindow):
         self.stop_install_btn.setEnabled(True)
         self.export_csv_btn.setEnabled(False)
         self.install_progress_label.setText("正在安装...")
+        self.install_progress_bar.setValue(0)
         
-        apk_names = [os.path.basename(p) for p in self.apk_paths]
+        apk_names = [os.path.basename(info["path"]) for info in self.apk_info_list]
+        packages = [info["package"] for info in self.apk_info_list if info["package"]]
         self.log(f"📦 开始安装到 {len(selected_devices)} 台设备")
         self.log(f"   APK: {', '.join(apk_names)}")
-        self.log(f"   包名：{package_name}")
+        self.log(f"   包名：{', '.join(packages) if packages else '未识别'}")
         self.log(f"   策略：{self.version_policy.currentText()}")
         
         self.install_thread = InstallThread(
-            selected_devices, self.apk_paths, package_name, max_threads, version_policy
+            selected_devices, self.apk_info_list, max_threads, version_policy
         )
         self.install_thread.install_progress.connect(self.on_install_progress)
         self.install_thread.task_finished.connect(self.on_install_task_finished)
@@ -1998,6 +2224,12 @@ class ADBBatchManager(QMainWindow):
                         "retry_count": 0
                     })
                     break
+        
+        # 更新进度条 #5
+        total = sum(self.install_stats.values())
+        if hasattr(self, 'install_selected_count') and self.install_selected_count > 0:
+            progress = int((total / self.install_selected_count) * 100)
+            self.install_progress_bar.setValue(min(progress, 100))
         
         # 记录安装结果用于导出 #22
         installed_ver = device_info.get("installed_version", "") if device_info else ""
@@ -2090,18 +2322,13 @@ class ADBBatchManager(QMainWindow):
             self.retry_device_table.setItem(row, 3, retry_count_item)
     
     def start_retry(self):
-        apk_path = self.apk_path_edit.text().strip()
-        package_name = self.package_name_edit.text().strip()
-        
-        if not apk_path:
+        # 使用安装时保存的APK路径，而非UI输入框
+        if not self.apk_paths:
             QMessageBox.warning(self, "错误", "请先在「应用安装」标签选择 APK 文件")
             return
-        if not package_name:
-            QMessageBox.warning(self, "错误", "请输入应用包名")
+        if not self.apk_info_list:
+            QMessageBox.warning(self, "错误", "APK 信息缺失，请重新选择 APK 文件")
             return
-        
-        if not self.apk_paths:
-            self.apk_paths = [apk_path]
         
         selected_devices = []
         for row in range(self.retry_device_table.rowCount()):
@@ -2121,7 +2348,7 @@ class ADBBatchManager(QMainWindow):
         self.retry_progress_label.setText("正在重试...")
         self.log(f"🔄 开始重试 {len(selected_devices)} 台设备")
         
-        self.retry_thread = RetryInstallThread(selected_devices, self.apk_paths, package_name, max_threads=5)
+        self.retry_thread = RetryInstallThread(selected_devices, self.apk_info_list, max_threads=self.install_threads.value())
         self.retry_thread.retry_progress.connect(self.on_retry_progress)
         self.retry_thread.retry_finished.connect(self.on_retry_finished)
         self.retry_thread.all_finished.connect(self.on_retry_all_finished)
@@ -2263,6 +2490,7 @@ class ADBBatchManager(QMainWindow):
         self.uninstall_progress_bar.setValue(0)
         self.log(f"🗑️ 开始卸载 {package_name} 从 {len(selected_devices)} 台设备")
         
+        self.uninstall_selected_count = len(selected_devices)
         self.uninstall_thread = UninstallThread(selected_devices, package_name, max_threads)
         self.uninstall_thread.uninstall_progress.connect(self.on_uninstall_progress)
         self.uninstall_thread.task_finished.connect(self.on_uninstall_task_finished)
@@ -2300,7 +2528,7 @@ class ADBBatchManager(QMainWindow):
             f"⏭️ 跳过：{self.uninstall_stats['skipped']}")
         
         if total > 0:
-            progress = int((total / len(self.devices)) * 100)
+            progress = int((total / self.uninstall_selected_count) * 100)
             self.uninstall_progress_bar.setValue(progress)
     
     def on_uninstall_all_finished(self):
