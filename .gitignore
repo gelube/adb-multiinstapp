@@ -13,3 +13,5 @@ debug.log
 debug_install.log
 stderr.log
 *.log
+*debug*
+!release/adb/
