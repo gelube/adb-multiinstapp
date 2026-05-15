@@ -4,3 +4,12 @@ dist/
 *.pyc
 *.spec
 devices.json
+*.bak*
+*.pre-v*
+check*.py
+crash_test.py
+crash.log
+debug.log
+debug_install.log
+stderr.log
+*.log
