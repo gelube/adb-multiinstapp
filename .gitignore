@@ -16,6 +16,4 @@ stderr.log
 *debug*
 release/
 
-# token缺workflow scope，暂不推送到仓库
-.github/
 *.zip
