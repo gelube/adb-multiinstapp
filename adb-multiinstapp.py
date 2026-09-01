@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+APP_VERSION = "3.4.1"
+
 """
-ADB 批量管理工具 v3.0
+ADB 批量管理工具
 用于局域网内批量发现 ADB 设备并进行应用安装/卸载管理
 增强版：版本检测、失败重试、自定义端口、多端口扫描、配置持久化、
         断线重连、设备搜索、多APK安装、深色主题、设备详情、CSV导出
@@ -357,7 +359,20 @@ class ADBWorker:
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            
+
+            # 后台线程排空 stdout，防止管道写满导致子进程阻塞死锁
+            import threading as _threading
+            stdout_chunks = []
+            def _drain_stdout():
+                try:
+                    for chunk in iter(proc.stdout.readline, ''):
+                        stdout_chunks.append(chunk)
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            drain = _threading.Thread(target=_drain_stdout, daemon=True)
+            drain.start()
+
             # 读取 stderr 实时检测阶段
             phase = None
             start_time = time.time()
@@ -366,26 +381,28 @@ class ADBWorker:
                 elapsed = time.time() - start_time
                 if elapsed > timeout:
                     proc.kill()
+                    drain.join(timeout=5)
                     return False, f"安装超时({timeout}秒)", phase
-                
+
                 line = proc.stderr.readline()
                 if not line:
                     # 检查进程是否结束
                     if proc.poll() is not None:
                         break
+                    time.sleep(0.05)
                     continue
                 line = line.strip()
                 if 'copying' in line.lower() or 'push' in line.lower():
                     phase = 'transferring'
                 elif 'Performing Streamed Install' in line or 'installing' in line.lower():
                     phase = 'installing'
-            
-            # 进程已结束，读取剩余输出
-            remaining_time = max(5, timeout - (time.time() - start_time))
-            proc.wait(timeout=remaining_time)
-            stdout = proc.stdout.read().strip()
+
+            # 进程已结束，等待 stdout 排空并读取剩余输出
+            drain.join(timeout=10)
+            proc.wait(timeout=max(5, timeout - (time.time() - start_time)))
+            stdout = ''.join(stdout_chunks).strip()
             stderr = proc.stderr.read().strip()
-            
+
             if proc.returncode == 0 and "Success" in stdout:
                 return True, "安装成功", phase
             error_msg = stderr or stdout or "安装失败"
@@ -472,9 +489,16 @@ def parse_ip_ranges(ip_str):
             # 判断是末段范围还是完整IP范围
             if '.' not in right:
                 # 末段范围: 192.168.1.100-200
-                prefix = left.rsplit('.', 1)[0]
-                start_last = int(left.rsplit('.', 1)[1])
-                end_last = int(right)
+                try:
+                    prefix = left.rsplit('.', 1)[0]
+                    start_last = int(left.rsplit('.', 1)[1])
+                    end_last = int(right)
+                except ValueError:
+                    continue
+                if not (0 <= start_last <= 255 and 0 <= end_last <= 255):
+                    continue
+                if start_last > end_last:
+                    start_last, end_last = end_last, start_last
                 for i in range(start_last, end_last + 1):
                     ip = f"{prefix}.{i}"
                     if ip not in seen:
@@ -577,9 +601,11 @@ class ScanThread(QThread):
         
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            result = sock.connect_ex((ip, port))
-            sock.close()
+            try:
+                sock.settimeout(2)
+                result = sock.connect_ex((ip, port))
+            finally:
+                sock.close()
             if result != 0:
                 return False, None, {}
         except Exception:
@@ -739,7 +765,8 @@ class InstallThread(QThread):
         device_info = {
             "installed_version": None,
             "apk_version_code": None,
-            "apk_version_name": None
+            "apk_version_name": None,
+            "package": None
         }
         apk_results = []  # [{apk_name, success, skipped, message}, ...]
         
@@ -755,9 +782,13 @@ class InstallThread(QThread):
             
             all_success = True
             last_msg = ""
-            
+
             # 逐个安装APK，每个APK用自己的包名做版本对比
             for idx, apk_info in enumerate(self.apk_info_list):
+                if self.stop_flag:
+                    last_msg = "已停止"
+                    self.install_progress.emit(device_id, "error", "安装已停止", device_info)
+                    return device_id, False, last_msg, device_info, apk_results
                 apk_path = apk_info["path"]
                 package_name = apk_info["package"]
                 apk_version_code = apk_info["version_code"]
@@ -767,6 +798,7 @@ class InstallThread(QThread):
                 # 更新device_info用于结果记录
                 device_info["apk_version_code"] = apk_version_code
                 device_info["apk_version_name"] = apk_version_name
+                device_info["package"] = package_name
                 
                 # 如果没有包名，跳过版本对比，直接安装
                 if not package_name:
@@ -826,7 +858,6 @@ class InstallThread(QThread):
                         # 强制覆盖：直接覆盖安装，不卸载（保留数据）
                         self.install_progress.emit(device_id, "comparing",
                             f"{apk_name} 强制覆盖安装 (已安装 v{installed_name})", device_info)
-                        import datetime; open('debug_install.log','a').write(f"{datetime.datetime.now():%H:%M:%S} [force] {device_id} {apk_name} is_installed={is_installed} skip={skip_this}\n")
                 
                 if skip_this:
                     apk_results.append({"apk_name": apk_name, "success": True, "skipped": True, "message": last_msg})
@@ -853,7 +884,6 @@ class InstallThread(QThread):
                         f"正在安装 v{apk_version_name or apk_version_code}...", device_info)
                 
                 success, msg, phase = self.adb.install(device_id, apk_path, replace=True)
-                import datetime; open('debug_install.log','a').write(f"{datetime.datetime.now():%H:%M:%S} [install] {device_id} {apk_name} success={success} msg={msg} policy={self.version_policy}\n")
                 
                 if not success:
                     all_success = False
@@ -931,6 +961,9 @@ class RetryInstallThread(QThread):
         
         # 逐个APK处理
         for idx, apk_info in enumerate(self.apk_info_list):
+            if self.stop_flag:
+                self.retry_progress.emit(device_id, "error", "重试已停止")
+                return device_id, False, "重试已停止"
             apk_path = apk_info["path"]
             package_name = apk_info.get("package", "")
             apk_name = os.path.basename(apk_path)
@@ -1075,27 +1108,45 @@ class DeviceDetailDialog(QDialog):
         # 异步加载详细信息（不阻塞UI）
         self._load_thread = None
         QTimer.singleShot(50, self._async_load_details)
-    
+
     def _async_load_details(self):
         """在后台线程加载设备详细信息"""
         import threading
-        
+
         class DetailLoader(QThread):
             loaded = pyqtSignal(dict, dict)
-            
+
             def __init__(self, device_id, adb):
                 super().__init__()
                 self.device_id = device_id
                 self.adb = adb
-            
+                self.stop_flag = False
+
             def run(self):
+                if self.stop_flag:
+                    return
                 info = self.adb.get_device_info(self.device_id)
+                if self.stop_flag:
+                    return
                 detail = self.adb.get_device_detail(self.device_id)
-                self.loaded.emit(info, detail)
-        
+                if not self.stop_flag:
+                    self.loaded.emit(info, detail)
+
         self._loader = DetailLoader(self.device_id, self.adb)
         self._loader.loaded.connect(self._update_ui)
         self._loader.start()
+
+    def closeEvent(self, event):
+        """关闭对话框时停止加载线程，避免信号发到已销毁的对象"""
+        loader = getattr(self, '_loader', None)
+        if loader is not None:
+            loader.stop_flag = True
+            try:
+                loader.loaded.disconnect()
+            except Exception:
+                pass
+            loader.wait(3000)
+        super().closeEvent(event)
     
     def _update_ui(self, info, detail):
         """在主线程更新UI"""
@@ -1223,7 +1274,7 @@ class ADBBatchManager(QMainWindow):
         self.load_settings()  # #16 加载保存的配置
         
         self.log("=" * 50)
-        self.log("ADB 批量管理工具 v3.4 已启动")
+        self.log(f"ADB 批量管理工具 v{APP_VERSION} 已启动")
         self.log("新功能：多端口 | 补扫 | 版本对比弹窗 | 搜索过滤 | 多APK | 详情 | 导出")
         self.log("=" * 50)
         self.check_adb()
@@ -1231,7 +1282,7 @@ class ADBBatchManager(QMainWindow):
         self.load_devices()
     
     def init_ui(self):
-        self.setWindowTitle("ADB 批量管理工具 v3.4")
+        self.setWindowTitle(f"ADB 批量管理工具 v{APP_VERSION}")
         self.setMinimumSize(1400, 900)
         
         central_widget = QWidget()
@@ -1258,7 +1309,6 @@ class ADBBatchManager(QMainWindow):
         self.install_threads.setValue(int(self.settings.value("install_threads", 30)))
         saved_policy = int(self.settings.value("version_policy", 0))
         self.version_policy.setCurrentIndex(saved_policy)
-        import datetime; open('debug_install.log','a').write(f"{datetime.datetime.now():%H:%M:%S} [load_settings] policy={saved_policy}\n")
         self.uninstall_threads.setValue(int(self.settings.value("uninstall_threads", 30)))
         
     
@@ -1725,6 +1775,15 @@ class ADBBatchManager(QMainWindow):
         log_line = f"[{timestamp}] {message}\n"
         self.log_text.append(log_line)
         self.log_text.moveCursor(QTextCursor.End)
+
+    def _disconnect_thread_signals(self, thread):
+        """断开旧工作线程对象的所有信号连接，避免回调叠加"""
+        if thread is None:
+            return
+        try:
+            thread.disconnect()
+        except Exception:
+            pass
     
     def check_adb(self):
         try:
@@ -1825,19 +1884,19 @@ class ADBBatchManager(QMainWindow):
         
         # 解析 IP
         ip_list = parse_ip_ranges(ip_str)
-        
+
+        if ip_list is None:
+            QMessageBox.warning(self, "范围过大",
+                "IP 范围超过 65536 个地址\n请缩小范围")
+            return
+
         if not ip_list:
-            QMessageBox.warning(self, "错误", 
+            QMessageBox.warning(self, "错误",
                 "IP 地址格式不正确\n\n"
                 "示例：\n"
                 "单IP: 192.168.1.100\n"
                 "范围: 192.168.1.100-200\n"
                 "多段: 192.168.1.100,192.168.2.50-60")
-            return
-        
-        if ip_list is None:
-            QMessageBox.warning(self, "范围过大", 
-                f"IP 范围超过 65536 个地址\n请缩小范围")
             return
         
         self.devices = []
@@ -1860,14 +1919,8 @@ class ADBBatchManager(QMainWindow):
             pass
 
         # 断开旧扫描线程信号连接
-        if hasattr(self, 'scan_thread') and self.scan_thread:
-            try:
-                self.scan_thread.device_found.disconnect()
-                self.scan_thread.scan_progress.disconnect()
-                self.scan_thread.scan_finished.disconnect()
-                self.scan_thread.log_message.disconnect()
-            except Exception:
-                pass
+        if hasattr(self, 'scan_thread'):
+            self._disconnect_thread_signals(self.scan_thread)
         
         self.scan_thread = ScanThread(ip_list, ports, max_threads)
         self.scan_thread.device_found.connect(self.on_device_found)
@@ -2267,7 +2320,6 @@ class ADBBatchManager(QMainWindow):
         self.check_installed_versions(package_names)
     
     def on_version_policy_changed(self, index):
-        import datetime; open('debug_install.log','a').write(f"{datetime.datetime.now():%H:%M:%S} [policy_changed] index={index}\n")
         tips = [
             "💡 智能对比：自动检测已安装版本，只有新版本才会安装",
             "💡 跳过已安装：只要已安装就跳过，不检查版本",
@@ -2460,13 +2512,8 @@ class ADBBatchManager(QMainWindow):
             self.check_version_thread.wait()
         
         # 断开旧信号连接，避免回调叠加
-        if hasattr(self, 'check_version_thread') and self.check_version_thread:
-            try:
-                self.check_version_thread.pkg_version_checked.disconnect()
-                self.check_version_thread.version_checked.disconnect()
-                self.check_version_thread.finished.disconnect()
-            except Exception:
-                pass
+        if hasattr(self, 'check_version_thread'):
+            self._disconnect_thread_signals(self.check_version_thread)
         
         self.check_version_thread = CheckVersionThread(self.devices, package_names, self.adb)
         self.check_version_thread.pkg_version_checked.connect(self._on_pkg_version_checked)
@@ -2647,7 +2694,6 @@ class ADBBatchManager(QMainWindow):
         max_threads = self.install_threads.value()
         policy_map = {0: "compare", 1: "skip", 2: "force"}
         version_policy = policy_map[self.version_policy.currentIndex()]
-        import datetime; open('debug_install.log','a').write(f"{datetime.datetime.now():%H:%M:%S} [_do_start_install] policy_index={self.version_policy.currentIndex()} policy={version_policy} combo_text={self.version_policy.currentText()}\n")
         
         self.install_btn.setEnabled(False)
         self.stop_install_btn.setEnabled(True)
@@ -2671,13 +2717,8 @@ class ADBBatchManager(QMainWindow):
         self.log(f"   策略：{self.version_policy.currentText()}")
         
         # 断开旧安装线程信号连接
-        if hasattr(self, 'install_thread') and self.install_thread:
-            try:
-                self.install_thread.install_progress.disconnect()
-                self.install_thread.task_finished.disconnect()
-                self.install_thread.all_finished.disconnect()
-            except Exception:
-                pass
+        if hasattr(self, 'install_thread'):
+            self._disconnect_thread_signals(self.install_thread)
         self.install_thread = InstallThread(
             selected_devices, self.apk_info_list, max_threads, version_policy
         )
@@ -2708,7 +2749,6 @@ class ADBBatchManager(QMainWindow):
             apk_results = []
         
         # 按设备计数（不是按APK操作计数）
-        import datetime; open('debug_install.log','a').write(f"{datetime.datetime.now():%H:%M:%S} [task_finished] {device_id} success={success} msg={message} apk_results={apk_results}\n")
         if apk_results:
             has_failure = any(not r["success"] for r in apk_results)
             all_skipped = all(r.get("skipped", False) for r in apk_results if r["success"])
@@ -2922,15 +2962,10 @@ class ADBBatchManager(QMainWindow):
         self.retry_progress_label.setText("正在重试...")
         self.log(f"🔄 开始重试 {len(selected_devices)} 台设备")
         
+        # 断开旧重试线程信号连接，避免回调叠加
+        if hasattr(self, 'retry_thread'):
+            self._disconnect_thread_signals(self.retry_thread)
         self.retry_thread = RetryInstallThread(selected_devices, self.apk_info_list, max_threads=self.install_threads.value())
-        # 断开旧信号
-        if hasattr(self, 'retry_thread') and self.retry_thread:
-            try:
-                self.retry_thread.retry_progress.disconnect()
-                self.retry_thread.retry_finished.disconnect()
-                self.retry_thread.all_finished.disconnect()
-            except Exception:
-                pass
         self.retry_thread.retry_progress.connect(self.on_retry_progress)
         self.retry_thread.retry_finished.connect(self.on_retry_finished)
         self.retry_thread.all_finished.connect(self.on_retry_all_finished)
@@ -3126,13 +3161,8 @@ class ADBBatchManager(QMainWindow):
             self.log(f"🗑️ 开始卸载 {package_names[0]} 从 {len(selected_devices)} 台设备")
             self.uninstall_selected_count = len(selected_devices)
             # 断开旧线程信号连接
-            if hasattr(self, 'uninstall_thread') and self.uninstall_thread:
-                try:
-                    self.uninstall_thread.uninstall_progress.disconnect()
-                    self.uninstall_thread.task_finished.disconnect()
-                    self.uninstall_thread.all_finished.disconnect()
-                except Exception:
-                    pass
+            if hasattr(self, 'uninstall_thread'):
+                self._disconnect_thread_signals(self.uninstall_thread)
             self.uninstall_thread = UninstallThread(selected_devices, package_names[0], max_threads)
             self.uninstall_thread.uninstall_progress.connect(self.on_uninstall_progress)
             self.uninstall_thread.task_finished.connect(self.on_uninstall_task_finished)
@@ -3158,13 +3188,8 @@ class ADBBatchManager(QMainWindow):
         self.uninstall_selected_count = len(self._uninstall_devices)
         self._uninstall_total_packages = len(self._uninstall_queue) + 1  # 当前+剩余
         # 断开旧线程信号连接
-        if hasattr(self, 'uninstall_thread') and self.uninstall_thread:
-            try:
-                self.uninstall_thread.uninstall_progress.disconnect()
-                self.uninstall_thread.task_finished.disconnect()
-                self.uninstall_thread.all_finished.disconnect()
-            except Exception:
-                pass
+        if hasattr(self, 'uninstall_thread'):
+            self._disconnect_thread_signals(self.uninstall_thread)
         self.uninstall_thread = UninstallThread(self._uninstall_devices, pkg, self._uninstall_max_threads)
         self.uninstall_thread.uninstall_progress.connect(self.on_uninstall_progress)
         self.uninstall_thread.task_finished.connect(self.on_uninstall_task_finished)
@@ -3181,6 +3206,10 @@ class ADBBatchManager(QMainWindow):
     def stop_uninstall(self):
         if self.uninstall_thread:
             self.uninstall_thread.stop()
+        # 多包名模式：清空队列，阻止后续包名继续启动
+        if getattr(self, '_uninstall_queue', None):
+            self._uninstall_queue = []
+            self.log("已取消剩余包名的卸载")
         self.log("卸载已停止")
         self.uninstall_btn.setEnabled(True)
         self.stop_uninstall_btn.setEnabled(False)
@@ -3274,7 +3303,8 @@ def main():
     def exception_hook(exc_type, exc_value, exc_tb):
         traceback.print_exception(exc_type, exc_value, exc_tb)
         try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'crash.log'), 'a', encoding='utf-8') as f:
+            log_dir = ADBWorker._get_app_dir()
+            with open(os.path.join(log_dir, 'crash.log'), 'a', encoding='utf-8') as f:
                 f.write(f"\n{'='*60}\n")
                 traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
         except:

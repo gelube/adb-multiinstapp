@@ -1,8 +1,8 @@
-# ADB 批量设备安装工具 v3.4
+# ADB 批量设备安装工具 v3.4.1
 
 局域网内批量发现 ADB 设备，进行应用安装/卸载/版本管理的 Windows 桌面工具。
 
-## ✨ v3.4 更新
+## ✨ v3.4.1 更新
 
 - 修复信号重复连接导致卸载死循环
 - 每行设备策略下拉框生效（支持单台设备独立策略）
@@ -52,7 +52,7 @@
 
 ## 📦 安装步骤
 
-1. 从 [Releases](https://github.com/gelube/adb-multiinstapp/releases) 下载最新版 `adb-multiinstapp-dist-v3.4.zip`
+1. 从 [Releases](https://github.com/gelube/adb-multiinstapp/releases) 下载最新版 `adb-multiinstapp-dist-v3.4.1.zip`
 2. 解压到任意目录
 3. 双击 `启动.bat` 运行
 
